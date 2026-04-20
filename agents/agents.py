@@ -3,7 +3,7 @@ Specialized Agents
 Each agent has a single responsibility and communicates via shared memory.
 All agents are async and support streaming where applicable.
 """
-
+import os
 import asyncio
 import json
 import uuid
@@ -13,11 +13,48 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Dict, List, Optional
 from core.orchestrator import AgentType, TaskStep
+from dotenv import load_dotenv
+load_dotenv()
+
 
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-3-haiku-20240307"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+
+def validate_api_key() -> bool:
+    """
+    Validate that ANTHROPIC_API_KEY is properly set.
+    
+    Returns:
+        bool: True if API key is valid, False otherwise
+        
+    Raises:
+        ValueError: If API key is missing or empty
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    
+    if not api_key:
+        raise ValueError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Please set it in your .env file or environment."
+        )
+    
+    if not isinstance(api_key, str) or len(api_key) < 10:
+        raise ValueError(
+            "ANTHROPIC_API_KEY appears to be invalid (too short). "
+            "Please verify your API key is correct."
+        )
+    
+    if not api_key.startswith(("sk-ant-", "sk-")):
+        logger.warning(
+            "ANTHROPIC_API_KEY does not match expected format (sk-ant-* or sk-*). "
+            "This may cause API errors."
+        )
+    
+    return True
 
 
 class BaseAgent(ABC):
@@ -33,12 +70,22 @@ class BaseAgent(ABC):
 
     async def _call_llm(self, system: str, user: str, max_tokens: int = 1024) -> str:
         """Call Anthropic API with retry logic."""
+        # Validate API key before making any requests
+        try:
+            validate_api_key()
+        except ValueError as e:
+            raise ValueError(str(e))
+        
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=60) as client:
                     resp = await client.post(
                         ANTHROPIC_API_URL,
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-api-key": os.getenv("ANTHROPIC_API_KEY"),
+                            "anthropic-version": "2023-06-01"
+                        },
                         json={
                             "model": DEFAULT_MODEL,
                             "max_tokens": max_tokens,
@@ -50,6 +97,14 @@ class BaseAgent(ABC):
                     data = resp.json()
                     return data["content"][0]["text"]
             except httpx.HTTPStatusError as e:
+                error_msg = f"Status {e.response.status_code}: "
+                try:
+                    error_data = e.response.json()
+                    error_msg += str(error_data)
+                except:
+                    error_msg += e.response.text
+                logger.error(f"API Error (attempt {attempt+1}): {error_msg}")
+                
                 if e.response.status_code == 529 and attempt < 2:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -58,33 +113,53 @@ class BaseAgent(ABC):
 
     async def _stream_llm(self, system: str, user: str, max_tokens: int = 2048) -> AsyncGenerator[str, None]:
         """Stream tokens from Anthropic API."""
+        # Validate API key before making any requests
+        try:
+            validate_api_key()
+        except ValueError as e:
+            raise ValueError(str(e))
+        
         async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream(
-                "POST",
-                ANTHROPIC_API_URL,
-                headers={"Content-Type": "application/json"},
-                json={
-                    "model": DEFAULT_MODEL,
-                    "max_tokens": max_tokens,
-                    "stream": True,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
-                },
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        raw = line[6:]
-                        if raw == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(raw)
-                            if event.get("type") == "content_block_delta":
-                                delta = event.get("delta", {})
-                                if delta.get("type") == "text_delta":
-                                    yield delta.get("text", "")
-                        except json.JSONDecodeError:
-                            continue
+            try:
+                async with client.stream(
+                    "POST",
+                    ANTHROPIC_API_URL,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-api-key": os.getenv("ANTHROPIC_API_KEY"),
+                        "anthropic-version": "2023-06-01"
+                    },
+                    json={
+                        "model": DEFAULT_MODEL,
+                        "max_tokens": max_tokens,
+                        "stream": True,
+                        "system": system,
+                        "messages": [{"role": "user", "content": user}],
+                    },
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            raw = line[6:]
+                            if raw == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(raw)
+                                if event.get("type") == "content_block_delta":
+                                    delta = event.get("delta", {})
+                                    if delta.get("type") == "text_delta":
+                                        yield delta.get("text", "")
+                            except json.JSONDecodeError:
+                                continue
+            except httpx.HTTPStatusError as e:
+                error_msg = f"Status {e.response.status_code}: "
+                try:
+                    error_data = e.response.json()
+                    error_msg += str(error_data)
+                except:
+                    error_msg += e.response.text
+                logger.error(f"Streaming API Error: {error_msg}")
+                raise
 
 
 class PlannerAgent(BaseAgent):
